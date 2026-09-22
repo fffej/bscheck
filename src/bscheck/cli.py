@@ -25,6 +25,10 @@ def render(report: dict, source: str, filename: str) -> str:
         output.append(
             f"{terminal_safe(filename)}:{line}:{column}: warning {diagnostic['code']}: {diagnostic['title']}"
         )
+        output.append(
+            f"      certainty: {diagnostic['certainty']:.1%} (minimum rule support)"
+        )
+        output.append(f"      type: {diagnostic['category']} / {diagnostic['subtype']}")
         original = lines[line - 1]
         displayed = terminal_safe(original).expandtabs(4)
         prefix = terminal_safe(original[: column - 1]).expandtabs(4)
@@ -50,11 +54,51 @@ def render(report: dict, source: str, filename: str) -> str:
     return "\n".join(output)
 
 
+def render_brief(report: dict, filename: str) -> str:
+    diagnostics = report["diagnostics"]
+    output = [
+        (
+            f"{terminal_safe(filename)}: {len(diagnostics)} warning(s) "
+            f"across {report['units_checked']} prose unit(s)."
+        )
+    ]
+    if not diagnostics:
+        return output[0] + " No bullshit detected. This is not a warranty."
+    categories = {}
+    for diagnostic in diagnostics:
+        groups = categories.setdefault(diagnostic["category"], {})
+        groups.setdefault(diagnostic["code"], []).append(diagnostic)
+    for category, groups in categories.items():
+        count = sum(len(items) for items in groups.values())
+        output.append(f"{category.capitalize()}: {count} warning(s)")
+        for code, items in sorted(groups.items()):
+            low = min(item["certainty"] for item in items)
+            high = max(item["certainty"] for item in items)
+            certainty = f"{low:.1%}" if low == high else f"{low:.1%}–{high:.1%}"
+            lines = sorted({item["span"]["line"] for item in items})
+            locations = ", ".join(map(str, lines[:8]))
+            if len(lines) > 8:
+                locations += f", … (+{len(lines) - 8} more)"
+            output.append(
+                f"  {code}: {items[0]['title']} — {len(items)} occurrence(s); "
+                f"certainty {certainty}; lines {locations}"
+            )
+    output.append(
+        "Certainty is minimum rule support. Use full output for excerpts and fixes."
+    )
+    return "\n".join(output)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Type-check your Markdown for bullshit. Powered by Jev."
     )
     parser.add_argument("file", nargs="?", help="Markdown file, or - for stdin")
+    parser.add_argument(
+        "--brief",
+        action="store_true",
+        help="Summarise text output by category and rule",
+    )
     parser.add_argument("--format", choices=("text", "json"), default="text")
     parser.add_argument(
         "--threshold",
@@ -75,9 +119,18 @@ def main(argv: list[str] | None = None) -> int:
         "--rules", action="store_true", help="Explain diagnostic codes; no API call"
     )
     args = parser.parse_args(argv)
+    if args.brief and args.format == "json":
+        parser.error("--brief requires text output; omit --format json")
     if args.rules:
-        for rule in RULES:
-            print(f"{rule.code}: {rule.title}\n  {rule.message}\n  help: {rule.help}")
+        for category in dict.fromkeys(rule.category for rule in RULES):
+            print(f"{category.capitalize()} bullshit")
+            for rule in RULES:
+                if rule.category == category:
+                    print(
+                        f"  {rule.code} [{rule.subtype}]: {rule.title}\n"
+                        f"    {rule.message}\n    help: {rule.help}"
+                    )
+            print()
         return 0
     if not args.file:
         parser.error("provide a Markdown file or - for stdin")
@@ -123,6 +176,8 @@ def main(argv: list[str] | None = None) -> int:
     print(
         json.dumps(report, indent=2, ensure_ascii=False)
         if args.format == "json"
+        else render_brief(report, filename)
+        if args.brief
         else render(report, source, filename)
     )
     return 1 if report["diagnostics"] else 0

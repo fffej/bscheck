@@ -3,9 +3,10 @@ from types import SimpleNamespace as NS
 import pytest
 from typesafe_sdk import TypeSafeError
 
-from bscheck.cli import main, render
+from bscheck.cli import main, render, render_brief
 from bscheck.core import (
     QUESTIONS,
+    RULES,
     Span,
     check,
     diagnose,
@@ -69,13 +70,14 @@ def test_batches_retain_full_context_and_model():
     client = FakeClient()
     source = "\n\n".join(f"Claim number {i}." for i in range(10))
     report = check(source, client)
-    assert len(client.calls) == 2
+    assert len(client.calls) == 4
     assert all(c["state"]["document"] == source for c in client.calls)
-    assert len(client.calls[0]["questions"]) == 64
-    assert len(client.calls[1]["questions"]) == 16
+    assert len(client.calls[0]["questions"]) == 3 * len(QUESTIONS)
+    assert len(client.calls[-1]["questions"]) == len(QUESTIONS)
+    assert all(len(call["questions"]) <= 64 for call in client.calls)
     assert report["units_checked"] == 10
     assert report["models"] == ["jev-test"]
-    assert report["input_tokens"] == 84
+    assert report["input_tokens"] == 168
 
 
 @pytest.mark.parametrize("value", [None, float("nan"), float("inf"), 1.1, -1, True])
@@ -140,7 +142,10 @@ def test_missing_answer_is_not_a_clean_bill_of_health():
         validate_answers({}, 1)
 
 
-def test_cli_warning_exit_and_environment_precedence(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("brief", [False, True])
+def test_cli_warning_exit_and_environment_precedence(
+    tmp_path, monkeypatch, capsys, brief
+):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TYPESAFE_API_KEY", "environment-key")
     (tmp_path / ".env").write_text("TYPESAFE_API_KEY=dotenv-key\n")
@@ -164,5 +169,116 @@ def test_cli_warning_exit_and_environment_precedence(tmp_path, monkeypatch, caps
             return response
 
     monkeypatch.setattr("bscheck.cli.TypeSafeClient", Client)
-    assert main([str(path)]) == 1
-    assert "warning BS002" in capsys.readouterr().out
+    assert main([str(path)] + (["--brief"] if brief else [])) == 1
+    output = capsys.readouterr().out
+    assert ("BS002: word salad" if brief else "warning BS002") in output
+
+
+@pytest.mark.parametrize("rule", RULES, ids=lambda rule: rule.code)
+def test_each_subtype_preserves_metadata_and_requires_every_signal(rule):
+    span = Span("Text.", 1, 1, 1, 6)
+    row = probabilities(
+        **{name: 0.95 if positive else 0.05 for name, positive in rule.signals}
+    )
+    diagnostic = next(d for d in diagnose(span, row, 0.8) if d["code"] == rule.code)
+    assert (diagnostic["category"], diagnostic["subtype"]) == (
+        rule.category,
+        rule.subtype,
+    )
+    for name, _ in rule.signals:
+        uncertain = row | {name: 0.5}
+        assert rule.code not in {d["code"] for d in diagnose(span, uncertain, 0.8)}
+
+
+def test_all_seven_families_in_offline_catalogue(capsys):
+    assert main(["--rules"]) == 0
+    output = capsys.readouterr().out
+    categories = {
+        "philosophical",
+        "linguistic",
+        "analytical",
+        "technological",
+        "organizational",
+        "social",
+        "professional",
+    }
+    assert {rule.category for rule in RULES} == categories
+    for category in categories:
+        assert output.count(f"{category.capitalize()} bullshit") == 1
+    for rule in RULES:
+        assert f"{rule.code} [{rule.subtype}]" in output
+
+
+def test_overlapping_families_are_not_forced_into_one_label():
+    span = Span("Text.", 1, 1, 1, 6)
+    diagnostics = diagnose(
+        span, probabilities(jargon=0.95, technical_costume=0.95), 0.8
+    )
+    assert {d["category"] for d in diagnostics} == {"linguistic", "technological"}
+    output = render(
+        {"diagnostics": diagnostics, "units_checked": 1}, "Text.", "test.md"
+    )
+    assert "type: technological / technical-costume" in output
+
+
+@pytest.mark.parametrize(
+    "signals,code,expected",
+    [
+        ({"jargon": 0.937}, "BS002", 0.937),
+        ({"causal": 0.97, "mechanism": 0.08}, "BS001", 0.92),
+        ({"causal": 0.85, "mechanism": 0.02}, "BS001", 0.85),
+    ],
+)
+def test_certainty_uses_weakest_required_support(signals, code, expected):
+    source = "A claim."
+    diagnostics = diagnose(Span(source, 1, 1, 1, 9), probabilities(**signals), 0.8)
+    diagnostic = next(d for d in diagnostics if d["code"] == code)
+    assert diagnostic["certainty"] == pytest.approx(expected)
+    text = render({"diagnostics": [diagnostic], "units_checked": 1}, source, "test.md")
+    assert f"certainty: {expected:.1%} (minimum rule support)" in text
+    # The reported value is also the boundary used by diagnostic gating.
+    assert code not in {
+        d["code"]
+        for d in diagnose(
+            Span(source, 1, 1, 1, 9), probabilities(**signals), expected + 0.001
+        )
+    }
+
+
+def test_brief_groups_counts_certainty_and_bounded_locations():
+    diagnostics = []
+    for line in range(1, 11):
+        diagnostics.extend(
+            diagnose(
+                Span("Text.", line, 1, line, 6),
+                probabilities(jargon=0.9 if line == 1 else 0.95),
+                0.8,
+            )
+        )
+    diagnostics.extend(
+        diagnose(
+            Span("Text.", 1, 7, 1, 12),
+            probabilities(jargon=0.99, causal=0.95, mechanism=0.05),
+            0.8,
+        )
+    )
+    output = render_brief({"diagnostics": diagnostics, "units_checked": 11}, "a\x1b.md")
+    assert "a?.md: 12 warning(s) across 11 prose unit(s)." in output
+    assert "Linguistic: 11 warning(s)" in output
+    assert output.count("BS002:") == 1
+    assert "11 occurrence(s); certainty 90.0%–99.0%" in output
+    assert "lines 1, 2, 3, 4, 5, 6, 7, 8, … (+2 more)" in output
+    assert "Analytical: 1 warning(s)" in output
+    assert "certainty 95.0%; lines 1" in output
+    assert "Text." not in output
+
+
+def test_brief_cli_empty_and_json_conflict(tmp_path, capsys):
+    path = tmp_path / "empty.md"
+    path.write_text("# Heading")
+    assert main([str(path), "--brief"]) == 0
+    assert "No bullshit detected. This is not a warranty." in capsys.readouterr().out
+    with pytest.raises(SystemExit) as error:
+        main([str(path), "--brief", "--format", "json"])
+    assert error.value.code == 2
+    assert "--brief requires text output" in capsys.readouterr().err
